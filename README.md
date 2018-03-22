@@ -42,7 +42,7 @@ The default timeout is 100ms, which is way too low for a search.
 
 Elasticsearch [doesn't immediately make results available to search](https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-refresh.html). You can force a refresh on every write by setting `RefreshPolicy.Immediate`, but ES warns this can cause performance issues until you give it a chance to fully rebuild the index.
 
-I've found that `termQuery` on names will sometimes return 0 hits, even with `RefreshPolicy.Immediate`. This is because Elasticsearch's search is [_near_ real-time](https://www.elastic.co/guide/en/elasticsearch/guide/current/near-real-time.html), not _actually_ real-time. The will turn up
+I've found that `termQuery` on names will sometimes return 0 hits, even with `RefreshPolicy.Immediate`. This is because Elasticsearch's search is [_near_ real-time](https://www.elastic.co/guide/en/elasticsearch/guide/current/near-real-time.html), not _actually_ real-time. Things will show up after a refresh, which Elasticsearch does every second by default. Or you can force one.
 
 ## Things untested
 

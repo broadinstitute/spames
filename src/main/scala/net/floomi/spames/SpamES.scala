@@ -120,6 +120,9 @@ object SpamES extends App {
     populateEntities(numEntities).await(Duration.Inf)
     println(s"${Calendar.getInstance.getTime} populated")
 
+    //refresh
+    client.execute { refreshIndex("myindex") }.await
+
     //make a ton of writes to them
 
     //NOTE: Some failure cases that start showing up >50 updates:
@@ -133,6 +136,9 @@ object SpamES extends App {
     println(s"${Calendar.getInstance.getTime} doing $numWrites writes to $numEntitiesWrittenTo entities in $numThreads threads...")
     parallelWrites(numEntitiesWrittenTo, numWrites, numThreads).await(Duration.Inf)
     println(s"${Calendar.getInstance.getTime} done")
+
+    //refresh again
+    client.execute { refreshIndex("myindex") }.await
 
     println(s"${Calendar.getInstance.getTime} querying...")
     val res = client.execute { searchWithType("myindex"/"entity").termQuery("name", s"entity_${Random.nextInt(numEntities)}") }.await
@@ -152,7 +158,7 @@ object SpamES extends App {
   } catch {
     case e: Exception => e.printStackTrace()
   } finally {
-    deleteESIndex()
+    //deleteESIndex()
     client.close()
     sys.exit()
   }
