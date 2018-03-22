@@ -1,10 +1,16 @@
 package net.floomi.spames
 
-import com.sksamuel.elastic4s.ElasticsearchClientUri
-import com.sksamuel.elastic4s.http.HttpClient
-import com.sksamuel.elastic4s.http.search.SearchResponse
-import org.elasticsearch.action.support.WriteRequest.RefreshPolicy
+import java.util.Calendar
+import java.util.concurrent.Executors
 
+import com.sksamuel.elastic4s.http.search.{SearchHit, SearchResponse}
+import org.apache.http.HttpHost
+import com.sksamuel.elastic4s.{ElasticsearchClientUri, RefreshPolicy}
+import com.sksamuel.elastic4s.http.{HttpClient, RequestFailure, RequestSuccess}
+import org.elasticsearch.client.RestClient
+
+import scala.concurrent.duration._
+import scala.concurrent.{ExecutionContext, Future}
 import scala.util.Random
 
 /*
@@ -17,7 +23,16 @@ object SpamES extends App {
   // you must import the DSL to use the syntax helpers
   import com.sksamuel.elastic4s.http.ElasticDsl._
 
-  val client = HttpClient(ElasticsearchClientUri("localhost", 9200))
+  val client = {
+    val restClient = RestClient
+      .builder(new HttpHost("localhost", 9200, "http"))
+      // The default timeout is 100̈ms, which is too slow for query operations.
+      .setRequestConfigCallback(
+      _.setConnectionRequestTimeout(10.seconds.toMillis.toInt)
+    )
+      .build()
+    HttpClient.fromRestClient(restClient)
+  }
 
   def randomValue(): Any = {
     Random.nextInt(7) match {
@@ -48,33 +63,99 @@ object SpamES extends App {
   }
 
   def populateEntities(numEntities: Int) = {
-    val entities = (1 to numEntities).map { i =>
-      indexInto("myIndex" / "entity").fields(generateFields(i))
+    val entities = (0 until numEntities).map { i =>
+      indexInto("myindex"/"entity").id(s"entity_$i").fields(generateFields(i))
     }
 
-    client.execute { bulk(entities).refresh(RefreshPolicy.WAIT_UNTIL) }.await
+    client.execute { bulk(entities).refresh(RefreshPolicy.WaitFor) }
+  }
+
+  def singleUpdate(x:Int): Map[String, Any] = {
+    Random.nextInt(4) match {
+      case 0 => Map("numeric" -> Random.nextDouble())
+      case 1 => Map("string" -> Random.alphanumeric.take(10))
+      case 2 => Map("simple_array" -> Seq(1,2,3,4,5, Random.nextInt(10)))
+      case 3 => Map("humongous_array" -> (1 to 1000).map ( _ => s"gs://${Random.alphanumeric.take(64).mkString}" ))
+    }
+  }
+
+  class ElasticException(msg: String) extends RuntimeException(msg)
+  class NoResultsException() extends RuntimeException()
+  class TooManyResultsException(hits: Array[SearchHit], msg: String) extends RuntimeException(s"$msg hits: ${hits.map(_.id).mkString(" ")}")
+
+  def extractSingleResult(res: Either[RequestFailure, RequestSuccess[SearchResponse]]): Future[SearchHit] = res match {
+    case Left(rf: RequestFailure) =>
+      Future.failed(new ElasticException(rf.error.toString))
+    case Right(rs: RequestSuccess[SearchResponse]) =>
+      rs.result.totalHits match {
+        case 0 => Future.failed(new NoResultsException())
+        case 1 => Future.successful(rs.result.hits.hits.head)
+        case _ => Future.failed(new TooManyResultsException(rs.result.hits.hits, rs.result.totalHits.toString))
+      }
+  }
+
+  def parallelWrites(numEntities: Int, numUpdates: Int, parallelism: Int): Future[Unit] = {
+    implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(parallelism))
+
+    //traverse executes in parallel
+    Future.traverse(1 to numUpdates){ _ =>
+
+      for {
+        chosen <- Future.successful{ Random.nextInt(numEntities) }
+        //sometimes this search fails to show up any results, so we'll switch to using the ID directly
+        //res <- client.execute { searchWithType("myindex"/"entity").termQuery("name", s"entity_$chosen").timeout(5.minutes) }
+        //extracted <- extractSingleResult(res)
+        _ <- client.execute { update(s"entity_$chosen").in("myindex"/"entity").doc(singleUpdate(chosen)).timeout(5.minutes).refresh(RefreshPolicy.Immediate) }
+      } yield ()
+
+    }.map(_ => ())
+
   }
 
   def run() = {
+    val numEntities = 1000
+
     //generate some entities
-    populateEntities(1000)
+    println(s"${Calendar.getInstance.getTime} populating entities...")
+    populateEntities(numEntities).await(Duration.Inf)
+    println(s"${Calendar.getInstance.getTime} populated")
 
     //make a ton of writes to them
-    //TODO
 
-    //done now
-    cleanup
+    //NOTE: Some failure cases that start showing up >50 updates:
+    //1. Sometimes search incorrectly returns no hits, possibly because the object has fallen off the index?
+    // --- RefreshPolicy.Immediate helps, but doesn't solve it
+    // --- is switching to IDs better?
+    //2. Timeout exceptions -- fixed by increasing timeout
+    val numWrites = 1000
+    val numEntitiesWrittenTo = 10
+    val numThreads = 20
+    println(s"${Calendar.getInstance.getTime} doing $numWrites writes to $numEntitiesWrittenTo entities in $numThreads threads...")
+    parallelWrites(numEntitiesWrittenTo, numWrites, numThreads).await(Duration.Inf)
+    println(s"${Calendar.getInstance.getTime} done")
+
+    println(s"${Calendar.getInstance.getTime} querying...")
+    val res = client.execute { searchWithType("myindex"/"entity").termQuery("name", s"entity_${Random.nextInt(numEntities)}") }.await
+    println(s"${Calendar.getInstance.getTime} done")
+    println(res.right.get.result.hits.hits.head.sourceAsString)
   }
 
-  def cleanup() = {
+  def deleteESIndex() = {
     //clean up after ourselves
     client.execute {
       deleteIndex("myindex")
-    }
-
-    client.close()
+    }.await
   }
 
-  run()
+  try {
+    run()
+  } catch {
+    case e: Exception => e.printStackTrace()
+  } finally {
+    deleteESIndex()
+    client.close()
+    sys.exit()
+  }
+
 
 }
