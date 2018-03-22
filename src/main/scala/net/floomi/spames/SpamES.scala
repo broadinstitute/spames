@@ -66,25 +66,28 @@ object SpamES extends App {
     baseFields ++ randomFields
   }
 
-  def populateEntities(numEntities: Int) = {
+  def populateEntities(numEntities: Int): Unit = {
     val entities = (0 until numEntities).map { i =>
       indexInto("myindex"/"entity").id(s"entity_$i").fields(generateFields(i))
     }
 
-    //we're awaiting in the main thread
-    execute { bulk(entities).refresh(RefreshPolicy.WaitFor) }
+    entities.grouped(100).foreach { batch =>
+      execute { bulk(batch).refresh(RefreshPolicy.None) }.await(Duration.Inf)
+      println(s"${Calendar.getInstance.getTime} one batch done")
+    }
   }
 
   def singleUpdate(x:Int): Map[String, Any] = {
     Random.nextInt(4) match {
       case 0 => Map("numeric" -> Random.nextDouble())
-      case 1 => Map("string" -> Random.alphanumeric.take(10))
+      case 1 => Map("string" -> Random.alphanumeric.take(10).mkString)
       case 2 => Map("simple_array" -> Seq(1,2,3,4,5, Random.nextInt(10)))
       case 3 => Map("humongous_array" -> (1 to 1000).map ( _ => s"gs://${Random.alphanumeric.take(64).mkString}" ))
     }
   }
 
   class ElasticException(rf: RequestFailure) extends RuntimeException(rf.error.reason)
+  class ConcurrentUpdateException(rf: RequestFailure) extends RuntimeException(rf.error.reason)
   class NoResultsException() extends RuntimeException()
   class TooManyResultsException(hits: Array[SearchHit], msg: String) extends RuntimeException(s"$msg hits: ${hits.map(_.id).mkString(" ")}")
 
@@ -110,7 +113,7 @@ object SpamES extends App {
         //sometimes this search fails to show up any results, so we'll switch to using the ID directly
         //res <- execute { searchWithType("myindex"/"entity").termQuery("name", s"entity_$chosen").timeout(5.minutes) }
         //extracted <- extractSingleResult(res)
-        _ <- execute { update(s"entity_$chosen").in("myindex"/"entity").doc(singleUpdate(chosen)).timeout(5.minutes).refresh(RefreshPolicy.Immediate) }
+        _ <- executeWithRetry { update(s"entity_$chosen").in("myindex"/"entity").doc(singleUpdate(chosen)).timeout(5.minutes).refresh(RefreshPolicy.Immediate) }
       } yield ()
 
     }.map(_ => ())
@@ -119,9 +122,21 @@ object SpamES extends App {
 
   def execute[T, U](request: T)(implicit exec: HttpExecutable[T, U], executionContext: ExecutionContext = ExecutionContext.Implicits.global): Future[RequestSuccess[U]] = {
     client.execute(request) flatMap {
-      case Left(fail: RequestFailure) => Future.failed(new ElasticException(fail))
-      case Right(success: RequestSuccess[U]) => Future.successful(success)
+      case Left(fail: RequestFailure) =>
+        fail.error.`type` match {
+          case "version_conflict_engine_exception" => Future.failed(new ConcurrentUpdateException(fail))
+          case _ => Future.failed(new ElasticException(fail))
+        }
+      case Right(success: RequestSuccess[U]) =>
+        Future.successful(success)
     }
+  }
+
+  def retry[T](op: => Future[T], retries: Int)(implicit ec: ExecutionContext): Future[T] =
+    op recoverWith { case _ if retries > 0 => retry(op, retries - 1) }
+
+  def executeWithRetry[T, U](request: T)(implicit exec: HttpExecutable[T, U], executionContext: ExecutionContext = ExecutionContext.Implicits.global): Future[RequestSuccess[U]] = {
+    retry(execute(request), 5)
   }
 
   def run() = {
@@ -132,7 +147,7 @@ object SpamES extends App {
 
     //generate some entities
     println(s"${Calendar.getInstance.getTime} populating $numEntities entities...")
-    val upload = populateEntities(numEntities).await(Duration.Inf)
+    val upload = populateEntities(numEntities)
     println(s"${Calendar.getInstance.getTime} populated")
 
     //refresh
